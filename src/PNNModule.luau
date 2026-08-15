@@ -10,8 +10,10 @@ end
 
 local module = {}
 
-function module.getNetwork(sizes, numParents, parentSizes)
+function module.getNetwork(sizes, numParents, parentSizes, includeParentOutputs, rng)
 	numParents = numParents or 0
+	includeParentOutputs = includeParentOutputs == true
+	rng = rng or Random.new()
 
 	local hasParents = numParents > 0 and type(parentSizes) == "table"
 	local network = {}
@@ -20,12 +22,17 @@ function module.getNetwork(sizes, numParents, parentSizes)
 		local layerSize = sizes[i]
 		local ownPrevSize = sizes[i - 1]
 		local lateralPerParent = 0
+		local parentOutputPerParent = 0
 
 		if hasParents and i > 2 then
 			lateralPerParent = parentSizes[i - 1] or 0
+
+			if includeParentOutputs and i == #sizes then
+				parentOutputPerParent = parentSizes[#parentSizes] or 0
+			end
 		end
 
-		local totalLateral = numParents * lateralPerParent
+		local totalLateral = numParents * (lateralPerParent + parentOutputPerParent)
 		local totalPrevSize = ownPrevSize + totalLateral
 		local heBound = math.sqrt(6 / totalPrevSize)
 
@@ -37,11 +44,14 @@ function module.getNetwork(sizes, numParents, parentSizes)
 			neuron.weights = {}
 			neuron.ownInputCount = ownPrevSize
 			neuron.lateralInputCount = totalLateral
+			neuron.parentCount = numParents
+			neuron.parentHiddenInputCount = lateralPerParent
+			neuron.parentOutputInputCount = parentOutputPerParent
 
 			for k = 1, totalPrevSize do
 				local isLateral = k > ownPrevSize
 				local scale = isLateral and 0.1 or 1.0
-				neuron.weights[k] = (math.random() * 2 - 1) * heBound * scale
+				neuron.weights[k] = (rng:NextNumber() * 2 - 1) * heBound * scale
 			end
 
 			layer[j] = neuron
@@ -63,16 +73,24 @@ local function buildLayerInputs(network, activations, layerIndex, parentActivati
 	end
 
 	local layerInputs = table.clone(currentInputs)
+	local parentCount = neuron.parentCount or 0
+	local parentHiddenInputCount = neuron.parentHiddenInputCount or 0
+	local parentOutputInputCount = neuron.parentOutputInputCount or 0
 
-	if parentActivationsList then
-		for _, parentActivations in ipairs(parentActivationsList) do
-			local parentLayerInputs = parentActivations[layerIndex]
+	for parentIndex = 1, parentCount do
+		local parentActivations = parentActivationsList and parentActivationsList[parentIndex] or nil
+		local parentLayerInputs = parentActivations and parentActivations[layerIndex] or nil
 
-			if parentLayerInputs then
-				for i = 1, #parentLayerInputs do
-					table.insert(layerInputs, parentLayerInputs[i] * lateralScale)
-				end
-			end
+		for inputIndex = 1, parentHiddenInputCount do
+			local value = parentLayerInputs and parentLayerInputs[inputIndex] or 0
+			table.insert(layerInputs, value * lateralScale)
+		end
+
+		local parentOutputs = parentActivations and parentActivations[#parentActivations] or nil
+
+		for outputIndex = 1, parentOutputInputCount do
+			local value = parentOutputs and parentOutputs[outputIndex] or 0
+			table.insert(layerInputs, value * lateralScale)
 		end
 	end
 
@@ -223,6 +241,34 @@ function module.compressNetwork(network, sizes)
 	end
 
 	return compressedNetwork
+end
+
+function module.forwardArchivedColumns(parentNetworks, inputs, lateralScale)
+	local activationsList = {}
+
+	for _, parentNetwork in ipairs(parentNetworks) do
+		local activations = module.forwardPass(
+			parentNetwork,
+			inputs,
+			activationsList,
+			lateralScale or 1
+		)
+		table.insert(activationsList, activations)
+	end
+
+	return activationsList
+end
+
+function module.maxAbsOutputDifference(leftActivations, rightActivations)
+	local left = leftActivations[#leftActivations]
+	local right = rightActivations[#rightActivations]
+	assert(#left == #right, "cannot compare output layers of different sizes")
+
+	local maximum = 0
+	for index = 1, #left do
+		maximum = math.max(maximum, math.abs(left[index] - right[index]))
+	end
+	return maximum
 end
 
 return module
