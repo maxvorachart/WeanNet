@@ -18,21 +18,52 @@ local humanoid = agent:WaitForChild("Humanoid")
 local humanoidRootPart = agent:WaitForChild("HumanoidRootPart")
 
 local save = true
-local key = 66
+local key = 73
 
 local gamma = 0.95
-local temperature = 1.05
+local temperature = 1.0
 local batchSize = 512
 local stageLengthBatches = 1000
 local maxBatches = stageLengthBatches * 2
 local networkShape = {39, 64, 64, 4}
+local seeds = {1, 2, 3, 4, 5}
+local parentOutputLateralConnectionOptions = {false}
+local checkpointNamespace = "MultiSeedExperimentV3"
+local checkpointVersion = 3
+local expectedBatches = maxBatches
+local configFingerprint = "reviewer-v3|architecture=Distilled|key=73|seeds=1,2,3,4,5|tasks=A-B|stageLength=1000|maxBatches=2000|batchSize=512|shape=39-64-64-4|gamma=0.95|temperature=1.0|rewardMultiplier=1.0|maskedInactiveCoordinates=true|raycastExclusions=agents+waypoints|waypointDisplay=regularOwnerActiveOnly|distillSteps=150|distillLR=0.05|distillTemperature=1.0|distillCacheSize=150|teacherDuringRL=false|parentOutputOptions=false|evaluation=greedy|evaluationEpisodes=5|evaluationStepsPerEpisode=256|seenTasksOnly=true|evaluationSuccess=anyWaypointCompletion|evaluationResetActionState=true"
+local checkpointEveryBatches = 5
+local evaluationEpisodes = 5
+local evaluationStepsPerEpisode = 256
+local rngDrawCount = 0
+local rng
+
+local function createTrackedRandom(seed, drawsToReplay)
+	local innerRandom = Random.new(seed)
+	local replayCount = drawsToReplay or 0
+
+	for _ = 1, replayCount do
+		innerRandom:NextNumber()
+	end
+
+	rngDrawCount = replayCount
+
+	local trackedRandom = {}
+
+	function trackedRandom:NextNumber()
+		rngDrawCount += 1
+		return innerRandom:NextNumber()
+	end
+
+	return trackedRandom
+end
 
 local normalWalkSpeed = 16
 local chaseReachDistance = 3
 local chaseProgressRewardScale = 1.0
 local chaseReachReward = 8
 local livingPenalty = 0.01
-local newSideTerminalMultiplier = 2.0
+local newSideTerminalMultiplier = 1.0
 
 local oldTargetWaypoint = 1
 local newTargetWaypoint = 1
@@ -40,36 +71,33 @@ local previousOldDistance
 local previousNewDistance
 local batch = {}
 local averageRewardsHistory = {}
+local evaluationByGeneration = {}
+local evaluationTaskOverride = nil
+local evaluationWaypointCompletions = 0
 local batchesCompleted = 0
-local initialDistillScale = 1.0
-local minDistillScale = 0.05
-local distillDecayBatches = 250
-local useDistillScaleDecay = true
+local distillSteps = 150
+local distillLearningRate = 0.05
+local distillTemperature = 1.0
+local distillCacheSize = 150
+local longOperationYieldInterval = 32
+local priorObservationCache = {}
+local priorObservationCursor = 1
 
-local batchesSinceRebirth = 0
 local lastRebirthStageNumber = 1
 local generation = 1
 local network
-local parentNetwork
+local isDistilling = false
 
-local aiType = "Distilled" 
-
-local function getCurrentDistillScale()
-	if not parentNetwork then
-		return 0
-	end
-	if not useDistillScaleDecay then
-		return initialDistillScale
-	end
-	local progress = math.clamp(batchesSinceRebirth / distillDecayBatches, 0, 1)
-	return minDistillScale + (initialDistillScale - minDistillScale) * (1 - progress)
-end
+local aiType = "Distilled"
 
 local function getStageNumber()
 	return math.floor(batchesCompleted / stageLengthBatches) + 1
 end
 
 local function isStageTwo()
+	if evaluationTaskOverride ~= nil then
+		return evaluationTaskOverride
+	end
 	return getStageNumber() % 2 == 0
 end
 
@@ -100,39 +128,12 @@ local function isOnNewSide()
 end
 
 local function updateGoals()
-	local stageTwo = isStageTwo()
+end
 
-	for _, waypoint in ipairs(oldWaypointsFolder:GetChildren()) do
-		waypoint.Transparency = 0
-		waypoint.CanTouch = true
-		waypoint.CanCollide = false
-		waypoint.CanQuery = true
-
-		if waypoint.Name == tostring(oldTargetWaypoint) then
-			waypoint.Color = agentColor
-		else
-			waypoint.Color = defaultColor
-		end
-	end
-
-	for _, waypoint in ipairs(newWaypointsFolder:GetChildren()) do
-		if stageTwo then
-			waypoint.Transparency = 0
-			waypoint.CanTouch = true
-			waypoint.CanCollide = false
-			waypoint.CanQuery = true
-
-			if waypoint.Name == tostring(newTargetWaypoint) then
-				waypoint.Color = agentColor
-			else
-				waypoint.Color = defaultColor
-			end
-		else
-			waypoint.Transparency = 1
-			waypoint.CanTouch = false
-			waypoint.CanCollide = false
-			waypoint.CanQuery = false
-		end
+local raycastExclusions = {oldWaypointsFolder, newWaypointsFolder}
+for _, candidate in ipairs(workspace:GetChildren()) do
+	if string.match(candidate.Name, "^Agent") then
+		table.insert(raycastExclusions, candidate)
 	end
 end
 
@@ -156,35 +157,81 @@ local function updateRayPart(name, origin, direction, distance)
 	part.CFrame = CFrame.lookAt(origin + direction.Unit * (distance / 2), origin + direction)
 end
 
+local function newExperiment()
+	return {
+		version = checkpointVersion,
+		configFingerprint = configFingerprint,
+		expectedBatches = expectedBatches,
+		runs = {},
+	}
+end
+
+local function assertCompatibleExperiment(experiment)
+	assert(experiment.version == checkpointVersion, "checkpoint version mismatch")
+	assert(experiment.configFingerprint == configFingerprint, "checkpoint configFingerprint mismatch")
+	assert(experiment.expectedBatches == expectedBatches, "checkpoint expectedBatches mismatch")
+end
+
 local function loadData(keyValue)
-	for i = 1, 5 do
-		local success, data = pcall(function()
+	for attempt = 1, 5 do
+		local success, storedRoot = pcall(function()
 			return aiDataStore:GetAsync(keyValue)
 		end)
 
 		if success then
-			return data
+			if type(storedRoot) == "table" and type(storedRoot[checkpointNamespace]) == "table" then
+				local experiment = storedRoot[checkpointNamespace]
+				assertCompatibleExperiment(experiment)
+				experiment.runs = type(experiment.runs) == "table" and experiment.runs or {}
+				return experiment
+			end
+
+			return newExperiment()
 		end
 
+		warn(string.format("Checkpoint load failed (attempt %d): %s", attempt, tostring(storedRoot)))
 		task.wait(1)
 	end
+
+	return newExperiment()
 end
 
-local function saveData(keyValue, data)
-	for i = 1, 5 do
-		local success = pcall(function()
-			aiDataStore:SetAsync(keyValue, data)
+local function saveData(keyValue, runId, runData)
+	for attempt = 1, 5 do
+		local success, errorMessage = pcall(function()
+			aiDataStore:UpdateAsync(keyValue, function(existing)
+				local root = type(existing) == "table" and existing or {}
+				local experiment = root[checkpointNamespace]
+
+				if type(experiment) == "table" then
+					assertCompatibleExperiment(experiment)
+				else
+					experiment = newExperiment()
+				end
+
+				experiment.version = checkpointVersion
+				experiment.configFingerprint = configFingerprint
+				experiment.expectedBatches = expectedBatches
+				experiment.runs = type(experiment.runs) == "table" and experiment.runs or {}
+				experiment.runs[runId] = runData
+				root[checkpointNamespace] = experiment
+				return root
+			end)
 		end)
 
 		if success then
-			return
+			return true
 		end
 
+		warn(string.format("Checkpoint save failed (attempt %d): %s", attempt, tostring(errorMessage)))
 		task.wait(1)
 	end
+
+	return false
 end
 
-local function softmax(outputs)
+local function softmax(outputs, requestedTemperature)
+	local effectiveTemperature = requestedTemperature or temperature
 	local maxOutput = -math.huge
 
 	for _, value in ipairs(outputs) do
@@ -197,7 +244,7 @@ local function softmax(outputs)
 	local exps = {}
 
 	for i, value in ipairs(outputs) do
-		exps[i] = math.exp((value - maxOutput) / temperature)
+		exps[i] = math.exp((value - maxOutput) / effectiveTemperature)
 		expSum += exps[i]
 	end
 
@@ -206,6 +253,82 @@ local function softmax(outputs)
 	end
 
 	return exps
+end
+
+local function cachePriorObservation(inputs)
+	local cachedInputs = table.clone(inputs)
+	if #priorObservationCache < distillCacheSize then
+		table.insert(priorObservationCache, cachedInputs)
+	else
+		priorObservationCache[priorObservationCursor] = cachedInputs
+		priorObservationCursor = (priorObservationCursor % distillCacheSize) + 1
+	end
+end
+
+local function runStandaloneDistillation(teacherNetwork)
+	assert(
+		#priorObservationCache == distillCacheSize,
+		string.format(
+			"distillation requires exactly %d cached prior-task observations; got %d",
+			distillCacheSize,
+			#priorObservationCache
+		)
+	)
+
+	local fixedDataset = priorObservationCache
+	local teacherProbabilities = {}
+	for sampleIndex, inputs in ipairs(fixedDataset) do
+		local teacherActivations = aiModule.forwardPass(teacherNetwork, inputs)
+		teacherProbabilities[sampleIndex] = softmax(
+			teacherActivations[#teacherActivations],
+			distillTemperature
+		)
+
+		if sampleIndex % longOperationYieldInterval == 0 then
+			task.wait()
+		end
+	end
+
+	local studentNetwork = aiModule.getNetwork(networkShape, nil, 0, rng)
+	for _ = 1, distillSteps do
+		local accumulatedGradients = aiModule.getBlankGradients(studentNetwork)
+
+		for sampleIndex, inputs in ipairs(fixedDataset) do
+			local activations = aiModule.forwardPass(studentNetwork, inputs)
+			local studentProbabilities = softmax(
+				activations[#activations],
+				distillTemperature
+			)
+			local outputErrors = {}
+
+			for outputIndex = 1, #studentProbabilities do
+				outputErrors[outputIndex] =
+					teacherProbabilities[sampleIndex][outputIndex]
+					- studentProbabilities[outputIndex]
+			end
+
+			local stepGradients = aiModule.backpropagate(
+				studentNetwork,
+				activations,
+				outputErrors
+			)
+			aiModule.addGradients(accumulatedGradients, stepGradients)
+
+			if sampleIndex % longOperationYieldInterval == 0 then
+				task.wait()
+			end
+		end
+
+		aiModule.updateWeights(
+			studentNetwork,
+			accumulatedGradients,
+			distillLearningRate / #fixedDataset
+		)
+	end
+
+	table.clear(priorObservationCache)
+	priorObservationCursor = 1
+	return studentNetwork
 end
 
 local function getDiscountedRewards(rewards)
@@ -222,7 +345,7 @@ end
 
 local function shuffleList(targetList)
 	for i = #targetList, 2, -1 do
-		local j = math.random(1, i)
+		local j = math.floor(rng:NextNumber() * i) + 1
 		targetList[i], targetList[j] = targetList[j], targetList[i]
 	end
 
@@ -231,7 +354,7 @@ end
 
 local function doAction(rawOutputs)
 	local probabilities = softmax(rawOutputs)
-	local roll = math.random()
+	local roll = rng:NextNumber()
 	local cumulative = 0
 
 	for i, probability in ipairs(probabilities) do
@@ -284,33 +407,37 @@ end
 
 local function getReward()
 	local stageTwo = isStageTwo()
-	local oldWaypoint = getOldWaypoint(oldTargetWaypoint)
-	local newWaypoint = stageTwo and getNewWaypoint(newTargetWaypoint) or nil
-	local oldDistance = oldWaypoint and getPlanarDistanceToPosition(oldWaypoint.Position) or nil
-	local newDistance = newWaypoint and getPlanarDistanceToPosition(newWaypoint.Position) or nil
-	local onNewSide = stageTwo and isOnNewSide()
-
+	local activeWaypoint = stageTwo
+		and getNewWaypoint(newTargetWaypoint)
+		or getOldWaypoint(oldTargetWaypoint)
+	local activeDistance = activeWaypoint
+		and getPlanarDistanceToPosition(activeWaypoint.Position)
+		or nil
+	local previousDistance = stageTwo and previousNewDistance or previousOldDistance
 	local reward = -livingPenalty
 
-	if onNewSide then
-		if newDistance and previousNewDistance then
-			reward += (previousNewDistance - newDistance) * chaseProgressRewardScale
-		end
-	else
-		if oldDistance and previousOldDistance then
-			reward += (previousOldDistance - oldDistance) * chaseProgressRewardScale
-		end
+	if activeDistance and previousDistance then
+		reward += (previousDistance - activeDistance) * chaseProgressRewardScale
 	end
 
-	previousOldDistance = oldDistance
-	previousNewDistance = newDistance
+	if stageTwo then
+		previousOldDistance = nil
+		previousNewDistance = activeDistance
+	else
+		previousOldDistance = activeDistance
+		previousNewDistance = nil
+	end
 
-	if onNewSide and newDistance and newDistance <= chaseReachDistance then
+	if activeDistance and activeDistance <= chaseReachDistance then
 		reward += chaseReachReward * newSideTerminalMultiplier
-		advanceNewWaypoint()
-	elseif (not onNewSide) and oldDistance and oldDistance <= chaseReachDistance then
-		reward += chaseReachReward
-		advanceOldWaypoint()
+		if evaluationTaskOverride ~= nil then
+			evaluationWaypointCompletions += 1
+		end
+		if stageTwo then
+			advanceNewWaypoint()
+		else
+			advanceOldWaypoint()
+		end
 	end
 
 	return reward
@@ -327,16 +454,22 @@ local function getInputs()
 
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = {agent}
+	params.CollisionGroup = humanoidRootPart.CollisionGroup
+	params.FilterDescendantsInstances = raycastExclusions
 
+	local stageTwo = isStageTwo()
 	local oldWaypoint = getOldWaypoint(oldTargetWaypoint)
 	local newWaypoint = getNewWaypoint(newTargetWaypoint)
 
 	local oldGoalPosition = oldWaypoint and oldWaypoint.Position or humanoidRootPart.Position
 	local newGoalPosition = newWaypoint and newWaypoint.Position or humanoidRootPart.Position
 
-	local relativeOld = humanoidRootPart.CFrame:PointToObjectSpace(oldGoalPosition)
-	local relativeNew = humanoidRootPart.CFrame:PointToObjectSpace(newGoalPosition)
+	local relativeOld = stageTwo
+		and Vector3.zero
+		or humanoidRootPart.CFrame:PointToObjectSpace(oldGoalPosition)
+	local relativeNew = stageTwo
+		and humanoidRootPart.CFrame:PointToObjectSpace(newGoalPosition)
+		or Vector3.zero
 
 	table.insert(inputs, math.tanh(relativeOld.Y * waypointSensitivity))
 	table.insert(inputs, math.tanh(relativeOld.Z * waypointSensitivity))
@@ -386,76 +519,263 @@ local function reset()
 	updateGoals()
 end
 
-if save then
-	local data = loadData(key)
+local function getEvaluationOutputs(inputs)
+	local activations = aiModule.forwardPass(network, inputs)
+	return activations[#activations]
+end
 
-	if data and data.network then
-		network = data.network
-		parentNetwork = data.parentNetwork
-		batchesCompleted = data.batchesCompleted or 0
-		batchesSinceRebirth = data.batchesSinceRebirth or 0
-		lastRebirthStageNumber = data.lastRebirthStageNumber or getStageNumber()
-		generation = data.generation or 1
-		averageRewardsHistory = data.averageRewardsHistory or {}
-	else
-		network = aiModule.getNetwork(networkShape)
-		parentNetwork = nil
-		batchesCompleted = 0
-		batchesSinceRebirth = 0
-		lastRebirthStageNumber = getStageNumber()
-		generation = 1
-		averageRewardsHistory = {}
+local function doGreedyAction(rawOutputs)
+	local bestIndex = 1
+	local bestValue = rawOutputs[1]
+	for index = 2, #rawOutputs do
+		if rawOutputs[index] > bestValue then
+			bestIndex = index
+			bestValue = rawOutputs[index]
+		end
 	end
 
-	game:BindToClose(function()
-		saveData(key, {
-			network = network,
-			parentNetwork = parentNetwork,
-			batchesCompleted = batchesCompleted,
-			batchesSinceRebirth = batchesSinceRebirth,
-			lastRebirthStageNumber = lastRebirthStageNumber,
-			generation = generation,
-			averageRewardsHistory = averageRewardsHistory
-		})
-	end)
-else
-	network = aiModule.getNetwork(networkShape)
-	parentNetwork = nil
-	batchesCompleted = 0
-	batchesSinceRebirth = 0
-	lastRebirthStageNumber = getStageNumber()
-	generation = 1
-	averageRewardsHistory = {}
+	if bestIndex == 1 then
+		humanoid.Jump = true
+	elseif bestIndex == 2 then
+		humanoid:Move(Vector3.new(0, 0, 1))
+	elseif bestIndex == 3 then
+		humanoid:Move(Vector3.new(0, 0, -1))
+	else
+		humanoid:Move(Vector3.new(0, 0, 0))
+	end
 end
+
+local function runGreedyEvaluation(taskIsB)
+	local savedOverride = evaluationTaskOverride
+	local savedWaypointCompletions = evaluationWaypointCompletions
+	local savedCFrame = humanoidRootPart.CFrame
+	local savedLinearVelocity = humanoidRootPart.AssemblyLinearVelocity
+	local savedAngularVelocity = humanoidRootPart.AssemblyAngularVelocity
+	local savedWalkSpeed = humanoid.WalkSpeed
+	local savedJump = humanoid.Jump
+	local savedMoveDirection = humanoid.MoveDirection
+	local savedOldTargetWaypoint = oldTargetWaypoint
+	local savedNewTargetWaypoint = newTargetWaypoint
+	local savedPreviousOldDistance = previousOldDistance
+	local savedPreviousNewDistance = previousNewDistance
+
+	evaluationTaskOverride = taskIsB
+	evaluationWaypointCompletions = 0
+	local rewardSum = 0
+	local successfulEpisodes = 0
+
+	for _ = 1, evaluationEpisodes do
+		humanoid.Jump = false
+		humanoid:Move(Vector3.new(0, 0, 0))
+		reset()
+		local completionsAtEpisodeStart = evaluationWaypointCompletions
+
+		for _ = 1, evaluationStepsPerEpisode do
+			task.wait()
+			local inputs = getInputs()
+			local rawOutputs = getEvaluationOutputs(inputs)
+			doGreedyAction(rawOutputs)
+			rewardSum += getReward()
+		end
+
+		if evaluationWaypointCompletions > completionsAtEpisodeStart then
+			successfulEpisodes += 1
+		end
+	end
+
+	local result = {
+		episodes = evaluationEpisodes,
+		stepsPerEpisode = evaluationStepsPerEpisode,
+		totalSteps = evaluationEpisodes * evaluationStepsPerEpisode,
+		meanRewardPerStep = rewardSum / (evaluationEpisodes * evaluationStepsPerEpisode),
+		waypointCompletions = evaluationWaypointCompletions,
+		successfulEpisodes = successfulEpisodes,
+		successRate = successfulEpisodes / evaluationEpisodes,
+	}
+
+	evaluationTaskOverride = savedOverride
+	evaluationWaypointCompletions = savedWaypointCompletions
+	oldTargetWaypoint = savedOldTargetWaypoint
+	newTargetWaypoint = savedNewTargetWaypoint
+	previousOldDistance = savedPreviousOldDistance
+	previousNewDistance = savedPreviousNewDistance
+	humanoid.WalkSpeed = savedWalkSpeed
+	humanoidRootPart.CFrame = savedCFrame
+	humanoidRootPart.AssemblyLinearVelocity = savedLinearVelocity
+	humanoidRootPart.AssemblyAngularVelocity = savedAngularVelocity
+	humanoid.Jump = savedJump
+	humanoid:Move(savedMoveDirection)
+
+	return result
+end
+
+local function ensureEvaluationForCompletedGeneration()
+	if batchesCompleted <= 0 or batchesCompleted % stageLengthBatches ~= 0 then
+		return
+	end
+
+	local completedGeneration = math.floor(batchesCompleted / stageLengthBatches)
+	if evaluationByGeneration[completedGeneration] then
+		return
+	end
+
+	local tasks = {
+		A = runGreedyEvaluation(false),
+	}
+	if completedGeneration >= 2 then
+		tasks.B = runGreedyEvaluation(true)
+	end
+
+	evaluationByGeneration[completedGeneration] = {
+		generation = completedGeneration,
+		afterBatches = batchesCompleted,
+		tasks = tasks,
+	}
+end
+
+local savedExperiment = save and loadData(key) or newExperiment()
+local currentRunId
+local currentSeed
+local currentRunNumber = 0
+local currentParentOutputLateralConnection = false
+local totalRuns = #seeds * #parentOutputLateralConnectionOptions
+
+local function getRunId(seed, useParentOutput)
+	return string.format("parent_%s_seed_%d", tostring(useParentOutput), seed)
+end
+
+local function printProgress(label)
+	local remaining = math.max(0, maxBatches - batchesCompleted)
+
+	print(string.format(
+		"%s | %s | run %d/%d | parent output %s | seed %d | batch %d/%d | %d left",
+		label,
+		aiType,
+		currentRunNumber,
+		totalRuns,
+		tostring(currentParentOutputLateralConnection),
+		currentSeed or 0,
+		batchesCompleted,
+		maxBatches,
+		remaining
+	))
+end
+
+local function saveCurrentRun(completed)
+	if not save or not currentRunId then
+		return true
+	end
+
+	local runData = {
+		version = checkpointVersion,
+		configFingerprint = configFingerprint,
+		expectedBatches = expectedBatches,
+		completed = completed == true,
+		seed = currentSeed,
+		usedParentOutputLateralConnection = currentParentOutputLateralConnection,
+		rngDrawCount = rngDrawCount,
+		network = network,
+		batchesCompleted = batchesCompleted,
+		priorObservationCache = priorObservationCache,
+		priorObservationCursor = priorObservationCursor,
+		lastRebirthStageNumber = lastRebirthStageNumber,
+		generation = generation,
+		averageRewardsHistory = averageRewardsHistory,
+		evaluationByGeneration = evaluationByGeneration,
+	}
+
+	local success = saveData(key, currentRunId, runData)
+
+	if success then
+		savedExperiment.runs[currentRunId] = runData
+	end
+
+	return success
+end
+
+game:BindToClose(function()
+	if isDistilling then
+		warn("Skipping Distilled checkpoint while a stage transition is in progress")
+		return
+	end
+
+	if currentRunId and batchesCompleted < maxBatches then
+		if saveCurrentRun(false) then
+			printProgress("Saved on shutdown")
+		else
+			printProgress("SAVE FAILED on shutdown")
+		end
+	end
+end)
+
+for parentOptionIndex, useParentOutputLateralConnection in ipairs(parentOutputLateralConnectionOptions) do
+	local seedResults = {}
+
+	for seedIndex, seed in ipairs(seeds) do
+		currentSeed = seed
+		currentRunNumber = (parentOptionIndex - 1) * #seeds + seedIndex
+		currentParentOutputLateralConnection = useParentOutputLateralConnection
+		currentRunId = getRunId(seed, useParentOutputLateralConnection)
+
+		local data = savedExperiment.runs[currentRunId]
+
+		if type(data) ~= "table"
+			or not data.network
+			or data.version ~= checkpointVersion
+			or data.configFingerprint ~= configFingerprint
+			or data.expectedBatches ~= expectedBatches
+		then
+			data = nil
+		end
+
+		rng = createTrackedRandom(seed, data and data.rngDrawCount or 0)
+		batchesCompleted = data and data.batchesCompleted or 0
+		averageRewardsHistory = data and data.averageRewardsHistory or {}
+		evaluationByGeneration = data and data.evaluationByGeneration or {}
+		table.clear(batch)
+
+		if data then
+			network = data.network
+			priorObservationCache = data.priorObservationCache or {}
+			priorObservationCursor = data.priorObservationCursor or 1
+			lastRebirthStageNumber = data.lastRebirthStageNumber or getStageNumber()
+			generation = data.generation or 1
+		else
+			network = aiModule.getNetwork(networkShape, nil, 0, rng)
+			priorObservationCache = {}
+			priorObservationCursor = 1
+			lastRebirthStageNumber = getStageNumber()
+			generation = 1
+		end
+
+		local progressLabel = data
+			and ((data.completed or batchesCompleted >= maxBatches) and "Loaded complete" or "Resumed")
+			or "Started"
+		printProgress(progressLabel)
+		ensureEvaluationForCompletedGeneration()
 
 while batchesCompleted < maxBatches do
 	local stageNumberForBatch = getStageNumber()
 
 	if stageNumberForBatch ~= lastRebirthStageNumber then
-		parentNetwork = aiModule.compressNetwork(network, networkShape)
-		network = aiModule.getNetwork(networkShape)
-		batchesSinceRebirth = 0
+		local frozenTeacher = network
+		isDistilling = true
+		local distilledNetwork = runStandaloneDistillation(frozenTeacher)
+		network = distilledNetwork
+		isDistilling = false
 		lastRebirthStageNumber = stageNumberForBatch
 		generation += 1
 	end
 
 	reset()
 
-	local currentDistillScale = getCurrentDistillScale()
-
 	for i = 1, batchSize do
 		task.wait()
 
 		local inputs = getInputs()
+		cachePriorObservation(inputs)
 		local activations = aiModule.forwardPass(network, inputs)
 		local rawOutputs = activations[#activations]
-		local parentOutputs = nil
-
-		if parentNetwork then
-			local parentActivations = aiModule.forwardPass(parentNetwork, inputs)
-			parentOutputs = parentActivations[#parentActivations]
-		end
-
 		local actionIndex = doAction(rawOutputs)
 		local reward = getReward()
 
@@ -463,9 +783,7 @@ while batchesCompleted < maxBatches do
 			activations = activations,
 			reward = reward,
 			actionIndex = actionIndex,
-			rawOutputs = rawOutputs,
-			parentOutputs = parentOutputs,
-			distillScale = currentDistillScale
+			rawOutputs = rawOutputs
 		}
 	end
 
@@ -513,24 +831,13 @@ while batchesCompleted < maxBatches do
 		local memory = shuffledBatch[i]
 		local outputErrors = {}
 		local probabilities = softmax(memory.rawOutputs)
-		local parentProbabilities = memory.parentOutputs and softmax(memory.parentOutputs) or nil
 
 		for j = 1, 4 do
-			local rlError
-
 			if j == memory.actionIndex then
-				rlError = memory.reward * (1 - probabilities[j])
+				outputErrors[j] = memory.reward * (1 - probabilities[j])
 			else
-				rlError = memory.reward * (0 - probabilities[j])
+				outputErrors[j] = memory.reward * (0 - probabilities[j])
 			end
-
-			local distillError = 0
-
-			if parentProbabilities then
-				distillError = memory.distillScale * (parentProbabilities[j] - probabilities[j])
-			end
-
-			outputErrors[j] = rlError + distillError
 		end
 
 		local stepGradients = aiModule.backpropagate(
@@ -539,29 +846,52 @@ while batchesCompleted < maxBatches do
 			outputErrors
 		)
 		aiModule.addGradients(accumulatedGradients, stepGradients)
+
+		if i % longOperationYieldInterval == 0 then
+			task.wait()
+		end
 	end
 
 	aiModule.updateWeights(network, accumulatedGradients)
 
 	batchesCompleted += 1
+	ensureEvaluationForCompletedGeneration()
 
-	if parentNetwork then
-		batchesSinceRebirth += 1
+	if save and batchesCompleted < maxBatches and batchesCompleted % checkpointEveryBatches == 0 then
+		if saveCurrentRun(false) then
+			printProgress("Checkpoint saved")
+		else
+			printProgress("CHECKPOINT SAVE FAILED")
+		end
 	end
 
 	table.clear(batch)
 end
 
-if save then
-	saveData(key, {
-		network = network,
-		parentNetwork = parentNetwork,
-		batchesCompleted = batchesCompleted,
-		batchesSinceRebirth = batchesSinceRebirth,
-		lastRebirthStageNumber = lastRebirthStageNumber,
-		generation = generation,
-		averageRewardsHistory = averageRewardsHistory
-	})
+ensureEvaluationForCompletedGeneration()
+
+if saveCurrentRun(true) then
+	printProgress("Completed")
+else
+	printProgress("FINAL SAVE FAILED")
 end
 
-print(aiType .. " Rewards:", averageRewardsHistory)
+table.insert(seedResults, {
+	seed = seed,
+	averageRewardPerBatch = table.clone(averageRewardsHistory),
+	evaluationByGeneration = evaluationByGeneration
+})
+	end
+
+local groupedResultTable = {
+	version = checkpointVersion,
+	configFingerprint = configFingerprint,
+	expectedBatches = expectedBatches,
+	stageSequence = {"A", "B"},
+	stageLengthBatches = stageLengthBatches,
+	architecture = aiType,
+	usedParentOutputLateralConnection = useParentOutputLateralConnection,
+	seeds = seedResults
+}
+print("WEANNET_GROUPED_RESULT", groupedResultTable)
+end
