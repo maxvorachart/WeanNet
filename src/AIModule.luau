@@ -10,8 +10,9 @@ end
 
 local module = {}
 
-function module.getNetwork(sizes, parentSizes, outputExtraInputCount)
+function module.getNetwork(sizes, parentSizes, outputExtraInputCount, rng)
 	outputExtraInputCount = outputExtraInputCount or 0
+	rng = rng or Random.new()
 
 	local hasParentSizes = type(parentSizes) == "table"
 	local network = {}
@@ -46,7 +47,7 @@ function module.getNetwork(sizes, parentSizes, outputExtraInputCount)
 			for k = 1, totalPrevSize do
 				local isExtraInput = k > ownPrevSize
 				local scale = isExtraInput and 0.1 or 1.0
-				neuron.weights[k] = (math.random() * 2 - 1) * heBound * scale
+				neuron.weights[k] = (rng:NextNumber() * 2 - 1) * heBound * scale
 			end
 
 			layer[j] = neuron
@@ -168,16 +169,22 @@ function module.backpropagate(network, activations, outputErrors, parentActivati
 	return gradients
 end
 
-function module.updateWeights(network, gradients)
-	for i = 1, #network do
+function module.updateWeights(network, gradients, learningRateOverride, firstTrainableLayer)
+	local effectiveLearningRate = learningRateOverride or learningRate
+	local firstLayer = firstTrainableLayer or 1
+
+	assert(firstLayer >= 1 and firstLayer <= #network, "firstTrainableLayer is outside the network")
+	assert(type(effectiveLearningRate) == "number" and effectiveLearningRate > 0, "learning rate must be positive")
+
+	for i = firstLayer, #network do
 		for j = 1, #network[i] do
 			local neuron = network[i][j]
 			local gradient = gradients[i][j]
 
-			neuron.bias += learningRate * gradient.bias
+			neuron.bias += effectiveLearningRate * gradient.bias
 
 			for k = 1, #neuron.weights do
-				neuron.weights[k] += learningRate * gradient.weights[k]
+				neuron.weights[k] += effectiveLearningRate * gradient.weights[k]
 			end
 		end
 	end
