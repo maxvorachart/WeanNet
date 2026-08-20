@@ -26,7 +26,6 @@ warnings.filterwarnings("ignore", message="Mean of empty slice")
 warnings.filterwarnings("ignore", message="Degrees of freedom")
 
 def select_device():
-    """Use CUDA only when the installed PyTorch build supports this GPU."""
     if not torch.cuda.is_available():
         return torch.device("cpu")
     try:
@@ -58,12 +57,13 @@ DEVICE = select_device()
 
 RUN_MODE = "all"
 
-OUTPUT_DIR = "concept_drift_revision_outputs"
+OUTPUT_DIR = "concept_drift_cumulative_core_outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
+CORE_STATE_DEFINITION = "never_drifted"
 RESUME_FROM_CHECKPOINT = True
 CHECKPOINT_FILE = os.path.join(OUTPUT_DIR, "concept_drift_checkpoint.pkl")
 RUN_CHECKPOINT = None
@@ -146,9 +146,9 @@ METRIC_KEYS = [
 
 
 def checkpoint_signature():
-    """Describe the manuscript run before accepting a saved checkpoint."""
     return {
         "version": CHECKPOINT_VERSION,
+        "core_state_definition": CORE_STATE_DEFINITION,
         "run_mode": RUN_MODE,
         "default_config": repr(DEFAULT),
         "method_order": tuple(METHOD_ORDER),
@@ -159,7 +159,6 @@ def checkpoint_signature():
 
 
 def save_checkpoint(checkpoint):
-    """Atomically replace the checkpoint so an abrupt close leaves it valid."""
     directory = os.path.dirname(os.path.abspath(CHECKPOINT_FILE))
     os.makedirs(directory, exist_ok=True)
     fd, temporary_path = tempfile.mkstemp(
@@ -268,6 +267,9 @@ class DriftEnv:
 
         self.targets = self.rng.randint(0, num_actions, size=num_states)
         self.decoys = np.full(num_states, -1, dtype=np.int64)
+        # A core state has never changed in any prior generation.  Keep the
+        # cumulative history separate from the current generation's drift.
+        self.ever_drifted_mask = np.zeros(num_states, dtype=bool)
         self.core_mask = np.ones(num_states, dtype=bool)
         self.drift_mask = np.zeros(num_states, dtype=bool)
         self.reset_attempt()
@@ -283,8 +285,8 @@ class DriftEnv:
         num_drift = max(1, int(self.num_states * self.drift_rate))
         drift_indices = self.rng.choice(self.num_states, size=num_drift, replace=False)
 
-        self.core_mask[:] = True
-        self.core_mask[drift_indices] = False
+        self.ever_drifted_mask[drift_indices] = True
+        self.core_mask[:] = ~self.ever_drifted_mask
         self.drift_mask[:] = False
         self.drift_mask[drift_indices] = True
 
@@ -552,7 +554,6 @@ class BatchedLateralNet(nn.Module):
         )
 
     def export_student_only(self):
-        """Create the actual deployment model with no parent or lateral state."""
         device = self.weights[0].device
         student = BatchedMLP(self.sizes, self.num_parallel, base_seed=0).to(device)
         with torch.no_grad():
@@ -1231,11 +1232,6 @@ def run_method(method_name, env_seed, train_seed, cfg, probe_every=0):
 
 
 def run_method_worker(method_name, env_seed, train_seed, cfg, probe_every):
-    """Run one independent method/seed job inside a spawned worker process.
-
-    Workers never read or write the shared checkpoint. Only the parent process
-    performs checkpoint I/O, preventing concurrent pickle writes.
-    """
 
 
     torch.set_num_threads(1)
@@ -1265,12 +1261,7 @@ def collect_runs(
     env_seeds=None,
     progress_label="",
 ):
-    """Collect method/seed runs, executing missing checkpoint entries in parallel.
 
-    Existing checkpoint entries are reused exactly as before. Missing entries
-    are submitted to independent spawned processes. The parent process alone
-    writes completed results back to the original checkpoint after each job.
-    """
     if env_seeds is None:
         env_seeds = EVALUATION_ENV_SEEDS
 
