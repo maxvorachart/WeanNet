@@ -19,7 +19,7 @@ local humanoid = agent:WaitForChild("Humanoid")
 local humanoidRootPart = agent:WaitForChild("HumanoidRootPart")
 
 local save = true
-local key = 73
+local key = 74
 
 local gamma = 0.95
 local temperature = 1.0
@@ -27,20 +27,22 @@ local batchSize = 512
 local stageLengthBatches = 1000
 local maxBatches = stageLengthBatches * 2
 local networkShape = {39, 64, 64, 4}
-local newHeadSeeds = {1, 2, 3, 4}
-local legacySeed = 5
+local newHeadSeeds = {1, 2, 3, 4, 5}
 local parentOutputLateralConnectionOptions = {false, true}
-local checkpointNamespace = "MultiSeedExperimentV3"
-local checkpointVersion = 3
-local runStorageVersion = 4
+local checkpointNamespace = "MultiSeedExperimentV4"
+local checkpointVersion = 4
+local runStorageVersion = 5
 local maxEncodedCheckpointBytes = 3500000
 local expectedBatches = maxBatches
-local configFingerprint = "reviewer-v3|architecture=PNNReset|key=73|seeds=1,2,3,4,5|tasks=A-B|stageLength=1000|maxBatches=2000|batchSize=512|shape=39-64-64-4|gamma=0.95|temperature=1.0|rewardMultiplier=1.0|maskedInactiveCoordinates=true|raycastExclusions=agents+waypoints|waypointDisplay=regularOwnerActiveOnly|oneParentReset=true|lateralScale=1.0|pairedInit=WeanNet|parentOutputOptions=false,true|evaluation=greedy|evaluationEpisodes=5|evaluationStepsPerEpisode=256|seenTasksOnly=true|evaluationSuccess=anyWaypointCompletion|evaluationResetActionState=true"
+local configFingerprint = "reviewer-v4|architecture=PNNReset|key=74|seeds=1,2,3,4,5|tasks=A-B-persistent-left-higher-right|stageLength=1000|maxBatches=2000|batchSize=512|shape=39-64-64-4|gamma=0.95|temperature=1.0|oldTerminalReward=8|newTerminalMultiplier=2.0|stage2BothTargets=true|stage2BothGoalCoordinates=true|raycastExclusions=agents+waypoints|waypointDisplay=stage1Old-stage2Both|oneParentReset=true|lateralScale=1.0|pairedInit=WeanNet|parentOutputOptions=false,true|evaluation=greedy|evaluationEpisodes=5|evaluationStepsPerEpisode=256|seenTasksOnly=true|evaluationSuccess=anyWaypointCompletion|evaluationSideCompletionCounts=true|evaluationResetActionState=true"
 local checkpointEveryBatches = 5
 local evaluationEpisodes = 5
 local evaluationStepsPerEpisode = 256
 local rngDrawCount = 0
 local rng
+local checkpointMaxAttempts = 5
+local checkpointPersistenceEnabled = save
+local checkpointPersistenceFailure = nil
 
 local function createTrackedRandom(seed, drawsToReplay)
 	local innerRandom = Random.new(seed)
@@ -67,7 +69,7 @@ local chaseReachDistance = 3
 local chaseProgressRewardScale = 1.0
 local chaseReachReward = 8
 local livingPenalty = 0.01
-local newSideTerminalMultiplier = 1.0
+local newSideTerminalMultiplier = 2.0
 
 local oldTargetWaypoint = 1
 local newTargetWaypoint = 1
@@ -78,6 +80,8 @@ local averageRewardsHistory = {}
 local evaluationByGeneration = {}
 local evaluationTaskOverride = nil
 local evaluationWaypointCompletions = 0
+local evaluationOldWaypointCompletions = 0
+local evaluationNewWaypointCompletions = 0
 local batchesCompleted = 0
 
 local initialLateralScale = 1.0
@@ -116,7 +120,7 @@ local function isStageTwo()
 end
 
 local function getStageName()
-	return isStageTwo() and "MirrorAlternate" or "NormalParkour"
+	return isStageTwo() and "PersistentChoiceParkour" or "NormalParkour"
 end
 
 local function getWalkSpeedForStage()
@@ -142,6 +146,25 @@ local function isOnNewSide()
 end
 
 local function updateGoals()
+	local stageTwo = isStageTwo()
+
+	for _, waypoint in ipairs(oldWaypointsFolder:GetDescendants()) do
+		if waypoint:IsA("BasePart") then
+			waypoint.Transparency = 0
+			waypoint.CanCollide = false
+			waypoint.CanTouch = false
+			waypoint.CanQuery = false
+		end
+	end
+
+	for _, waypoint in ipairs(newWaypointsFolder:GetDescendants()) do
+		if waypoint:IsA("BasePart") then
+			waypoint.Transparency = stageTwo and 0 or 1
+			waypoint.CanCollide = false
+			waypoint.CanTouch = false
+			waypoint.CanQuery = false
+		end
+	end
 end
 
 local raycastExclusions = {oldWaypointsFolder, newWaypointsFolder}
@@ -180,75 +203,71 @@ local function newExperiment()
 	}
 end
 
-local function assertCompatibleExperiment(experiment)
-	assert(experiment.version == checkpointVersion, "checkpoint version mismatch")
-	assert(experiment.configFingerprint == configFingerprint, "checkpoint configFingerprint mismatch")
-	assert(experiment.expectedBatches == expectedBatches, "checkpoint expectedBatches mismatch")
-end
-
-local function loadLegacyData(keyValue)
-	for attempt = 1, 5 do
-		local success, storedRoot = pcall(function()
-			return aiDataStore:GetAsync(keyValue)
-		end)
-
-		if success then
-			if type(storedRoot) == "table" and type(storedRoot[checkpointNamespace]) == "table" then
-				local experiment = storedRoot[checkpointNamespace]
-				assertCompatibleExperiment(experiment)
-				experiment.runs = type(experiment.runs) == "table" and experiment.runs or {}
-				return experiment
-			end
-
-			return newExperiment()
-		end
-
-		warn(string.format("Legacy checkpoint load failed (attempt %d): %s", attempt, tostring(storedRoot)))
-		task.wait(1)
+local function disableCheckpointPersistence(reason)
+	if not checkpointPersistenceEnabled then
+		return
 	end
 
-	error("Legacy checkpoint load failed after 5 attempts; refusing to start with empty data")
+	checkpointPersistenceEnabled = false
+	checkpointPersistenceFailure = tostring(reason)
+	warn(string.format(
+		"Checkpoint persistence disabled: %s. Training will continue in memory; copy the final grouped result from the server output.",
+		checkpointPersistenceFailure
+		))
 end
 
 local function getRunStorageKey(keyValue, runId)
-	local storageKey = string.format("MSE4:%s:%s", tostring(keyValue), runId)
+	local storageKey = string.format("MSE5:%s:%s", tostring(keyValue), runId)
 	assert(#storageKey <= 50, "run checkpoint key exceeds DataStore's 50-character limit")
 	return storageKey
 end
 
-local function isDeterministicSizeError(errorMessage)
+local function isNonRetryableDataStoreError(errorMessage)
 	local message = string.lower(tostring(errorMessage))
 	return string.find(message, "valuetoolarge", 1, true) ~= nil
 		or string.find(message, "serialized value exceeds", 1, true) ~= nil
-		or string.find(message, "105:", 1, true) ~= nil
+		or string.find(message, "cantstorevalue", 1, true) ~= nil
+		or string.find(message, "can't store", 1, true) ~= nil
+		or string.find(message, "storage quota", 1, true) ~= nil
+		or string.find(message, "quota exceeded", 1, true) ~= nil
+		or string.find(message, "storage limit", 1, true) ~= nil
+		or string.find(message, "incompatible existing run checkpoint", 1, true) ~= nil
 end
 
-local function loadRunData(keyValue, runId, legacyExperiment)
+local function waitBeforeDataStoreRetry(attempt)
+	task.wait(math.min(8, 2 ^ (attempt - 1)))
+end
+
+local function loadRunData(keyValue, runId)
+	if not checkpointPersistenceEnabled then
+		return nil
+	end
+
 	local storageKey = getRunStorageKey(keyValue, runId)
 
-	for attempt = 1, 5 do
+	for attempt = 1, checkpointMaxAttempts do
 		local success, storedEnvelope = pcall(function()
 			return aiDataStore:GetAsync(storageKey)
 		end)
 
 		if success then
 			if storedEnvelope == nil then
-				local legacyRun = legacyExperiment.runs[runId]
-				return legacyRun, legacyRun and "legacy" or "new"
+				return nil
 			end
 
-			assert(type(storedEnvelope) == "table", "run checkpoint envelope is not a table")
-			assert(storedEnvelope.storageVersion == runStorageVersion, "run checkpoint storage version mismatch")
-			assert(storedEnvelope.namespace == checkpointNamespace, "run checkpoint namespace mismatch")
-			assert(tostring(storedEnvelope.baseKey) == tostring(keyValue), "run checkpoint base key mismatch")
-			assert(storedEnvelope.runId == runId, "run checkpoint runId mismatch")
-			assert(
-				storedEnvelope.seedsPerHead == #newHeadSeeds
-					or storedEnvelope.seedsPerHead == legacySeed,
-				"run checkpoint seedsPerHead mismatch"
-			)
-			assert(type(storedEnvelope.run) == "table", "run checkpoint payload is missing")
-			return storedEnvelope.run, "shard"
+			if type(storedEnvelope) ~= "table"
+				or storedEnvelope.storageVersion ~= runStorageVersion
+				or storedEnvelope.namespace ~= checkpointNamespace
+				or tostring(storedEnvelope.baseKey) ~= tostring(keyValue)
+				or storedEnvelope.runId ~= runId
+				or storedEnvelope.seedsPerHead ~= #newHeadSeeds
+				or type(storedEnvelope.run) ~= "table"
+			then
+				disableCheckpointPersistence("existing run checkpoint is incompatible")
+				return nil
+			end
+
+			return storedEnvelope.run
 		end
 
 		warn(string.format(
@@ -256,17 +275,25 @@ local function loadRunData(keyValue, runId, legacyExperiment)
 			runId,
 			attempt,
 			tostring(storedEnvelope)
-		))
-		task.wait(1)
+			))
+		if isNonRetryableDataStoreError(storedEnvelope) then
+			disableCheckpointPersistence(storedEnvelope)
+			return nil
+		end
+		if attempt < checkpointMaxAttempts then
+			waitBeforeDataStoreRetry(attempt)
+		end
 	end
 
-	error(string.format(
-		"Run checkpoint load failed for %s after 5 attempts; refusing to overwrite it",
-		runId
-	))
+	disableCheckpointPersistence("run checkpoint load failed after retry limit")
+	return nil
 end
 
 local function saveData(keyValue, runId, runData, seedsPerHead)
+	if not checkpointPersistenceEnabled then
+		return false
+	end
+
 	local storageKey = getRunStorageKey(keyValue, runId)
 	local envelope = {
 		storageVersion = runStorageVersion,
@@ -281,27 +308,31 @@ local function saveData(keyValue, runId, runData, seedsPerHead)
 		return HttpService:JSONEncode(envelope)
 	end)
 	if not encodeSuccess then
-		warn(string.format("Checkpoint serialization failed for %s: %s", runId, tostring(encodedOrError)))
+		disableCheckpointPersistence("checkpoint serialization failed: " .. tostring(encodedOrError))
 		return false
 	end
 	if #encodedOrError > maxEncodedCheckpointBytes then
-		warn(string.format(
-			"Checkpoint for %s is %d bytes; refusing write above %d-byte safety limit",
+		disableCheckpointPersistence(string.format(
+			"checkpoint for %s is %d bytes, above the %d-byte safety limit",
 			runId,
 			#encodedOrError,
 			maxEncodedCheckpointBytes
-		))
+			))
 		return false
 	end
 
-	for attempt = 1, 5 do
+	for attempt = 1, checkpointMaxAttempts do
 		local success, errorMessage = pcall(function()
 			aiDataStore:UpdateAsync(storageKey, function(existing)
-				if type(existing) == "table" then
-					assert(existing.storageVersion == runStorageVersion, "existing run storage version mismatch")
-					assert(existing.namespace == checkpointNamespace, "existing run namespace mismatch")
-					assert(tostring(existing.baseKey) == tostring(keyValue), "existing run base key mismatch")
-					assert(existing.runId == runId, "existing runId mismatch")
+				if existing ~= nil then
+					if type(existing) ~= "table"
+						or existing.storageVersion ~= runStorageVersion
+						or existing.namespace ~= checkpointNamespace
+						or tostring(existing.baseKey) ~= tostring(keyValue)
+						or existing.runId ~= runId
+					then
+						error("incompatible existing run checkpoint")
+					end
 				end
 				return envelope
 			end)
@@ -312,12 +343,16 @@ local function saveData(keyValue, runId, runData, seedsPerHead)
 		end
 
 		warn(string.format("Checkpoint save failed (attempt %d): %s", attempt, tostring(errorMessage)))
-		if isDeterministicSizeError(errorMessage) then
+		if isNonRetryableDataStoreError(errorMessage) then
+			disableCheckpointPersistence(errorMessage)
 			return false
 		end
-		task.wait(1)
+		if attempt < checkpointMaxAttempts then
+			waitBeforeDataStoreRetry(attempt)
+		end
 	end
 
+	disableCheckpointPersistence("checkpoint save failed after retry limit")
 	return false
 end
 
@@ -421,37 +456,50 @@ end
 
 local function getReward()
 	local stageTwo = isStageTwo()
-	local activeWaypoint = stageTwo
-		and getNewWaypoint(newTargetWaypoint)
-		or getOldWaypoint(oldTargetWaypoint)
-	local activeDistance = activeWaypoint
-		and getPlanarDistanceToPosition(activeWaypoint.Position)
+	local oldWaypoint = getOldWaypoint(oldTargetWaypoint)
+	local newWaypoint = stageTwo and getNewWaypoint(newTargetWaypoint) or nil
+	local oldDistance = oldWaypoint
+		and getPlanarDistanceToPosition(oldWaypoint.Position)
 		or nil
-	local previousDistance = stageTwo and previousNewDistance or previousOldDistance
+	local newDistance = newWaypoint
+		and getPlanarDistanceToPosition(newWaypoint.Position)
+		or nil
 	local reward = -livingPenalty
 
-	if activeDistance and previousDistance then
-		reward += (previousDistance - activeDistance) * chaseProgressRewardScale
-	end
-
 	if stageTwo then
-		previousOldDistance = nil
-		previousNewDistance = activeDistance
-	else
-		previousOldDistance = activeDistance
-		previousNewDistance = nil
+		-- Task B keeps the old route as a local optimum while adding a more
+		-- valuable new route. Reward progress toward either route, not the
+		-- sum, so moving right is not penalized for leaving the old route.
+		local bestProgress = 0
+		if oldDistance and previousOldDistance then
+			bestProgress = math.max(bestProgress, previousOldDistance - oldDistance)
+		end
+		if newDistance and previousNewDistance then
+			bestProgress = math.max(bestProgress, previousNewDistance - newDistance)
+		end
+		reward += bestProgress * chaseProgressRewardScale
+	elseif oldDistance and previousOldDistance then
+		reward += (previousOldDistance - oldDistance) * chaseProgressRewardScale
 	end
 
-	if activeDistance and activeDistance <= chaseReachDistance then
+	previousOldDistance = oldDistance
+	previousNewDistance = newDistance
+
+	-- Only the new/right route receives the terminal multiplier in Task B.
+	if stageTwo and newDistance and newDistance <= chaseReachDistance then
 		reward += chaseReachReward * newSideTerminalMultiplier
 		if evaluationTaskOverride ~= nil then
 			evaluationWaypointCompletions += 1
+			evaluationNewWaypointCompletions += 1
 		end
-		if stageTwo then
-			advanceNewWaypoint()
-		else
-			advanceOldWaypoint()
+		advanceNewWaypoint()
+	elseif oldDistance and oldDistance <= chaseReachDistance then
+		reward += chaseReachReward
+		if evaluationTaskOverride ~= nil then
+			evaluationWaypointCompletions += 1
+			evaluationOldWaypointCompletions += 1
 		end
+		advanceOldWaypoint()
 	end
 
 	return reward
@@ -478,9 +526,7 @@ local function getInputs()
 	local oldGoalPosition = oldWaypoint and oldWaypoint.Position or humanoidRootPart.Position
 	local newGoalPosition = newWaypoint and newWaypoint.Position or humanoidRootPart.Position
 
-	local relativeOld = stageTwo
-		and Vector3.zero
-		or humanoidRootPart.CFrame:PointToObjectSpace(oldGoalPosition)
+	local relativeOld = humanoidRootPart.CFrame:PointToObjectSpace(oldGoalPosition)
 	local relativeNew = stageTwo
 		and humanoidRootPart.CFrame:PointToObjectSpace(newGoalPosition)
 		or Vector3.zero
@@ -575,6 +621,8 @@ end
 local function runGreedyEvaluation(taskIsB)
 	local savedOverride = evaluationTaskOverride
 	local savedWaypointCompletions = evaluationWaypointCompletions
+	local savedOldWaypointCompletions = evaluationOldWaypointCompletions
+	local savedNewWaypointCompletions = evaluationNewWaypointCompletions
 	local savedCFrame = humanoidRootPart.CFrame
 	local savedLinearVelocity = humanoidRootPart.AssemblyLinearVelocity
 	local savedAngularVelocity = humanoidRootPart.AssemblyAngularVelocity
@@ -588,6 +636,8 @@ local function runGreedyEvaluation(taskIsB)
 
 	evaluationTaskOverride = taskIsB
 	evaluationWaypointCompletions = 0
+	evaluationOldWaypointCompletions = 0
+	evaluationNewWaypointCompletions = 0
 	local rewardSum = 0
 	local successfulEpisodes = 0
 
@@ -616,12 +666,16 @@ local function runGreedyEvaluation(taskIsB)
 		totalSteps = evaluationEpisodes * evaluationStepsPerEpisode,
 		meanRewardPerStep = rewardSum / (evaluationEpisodes * evaluationStepsPerEpisode),
 		waypointCompletions = evaluationWaypointCompletions,
+		oldWaypointCompletions = evaluationOldWaypointCompletions,
+		newWaypointCompletions = evaluationNewWaypointCompletions,
 		successfulEpisodes = successfulEpisodes,
 		successRate = successfulEpisodes / evaluationEpisodes,
 	}
 
 	evaluationTaskOverride = savedOverride
 	evaluationWaypointCompletions = savedWaypointCompletions
+	evaluationOldWaypointCompletions = savedOldWaypointCompletions
+	evaluationNewWaypointCompletions = savedNewWaypointCompletions
 	oldTargetWaypoint = savedOldTargetWaypoint
 	newTargetWaypoint = savedNewTargetWaypoint
 	previousOldDistance = savedPreviousOldDistance
@@ -660,7 +714,6 @@ local function ensureEvaluationForCompletedGeneration()
 	}
 end
 
-local legacyExperiment = save and loadLegacyData(key) or newExperiment()
 local currentRunId
 local currentSeed
 local currentRunNumber = 0
@@ -675,9 +728,6 @@ local seedsByParentOutput = {}
 local totalRuns = 0
 for _, useParentOutput in ipairs(parentOutputLateralConnectionOptions) do
 	local headSeeds = table.clone(newHeadSeeds)
-	if type(legacyExperiment.runs[getRunId(legacySeed, useParentOutput)]) == "table" then
-		table.insert(headSeeds, legacySeed)
-	end
 	seedsByParentOutput[useParentOutput] = headSeeds
 	totalRuns += #headSeeds
 end
@@ -696,12 +746,15 @@ local function printProgress(label)
 		batchesCompleted,
 		maxBatches,
 		remaining
-	))
+		))
 end
 
 local function saveCurrentRun(completed)
 	if not save or not currentRunId then
 		return true
+	end
+	if not checkpointPersistenceEnabled then
+		return false
 	end
 
 	local runData = {
@@ -727,8 +780,10 @@ end
 
 game:BindToClose(function()
 	if currentRunId and batchesCompleted < maxBatches then
-		if saveCurrentRun(false) then
+		if checkpointPersistenceEnabled and saveCurrentRun(false) then
 			printProgress("Saved on shutdown")
+		elseif not checkpointPersistenceEnabled then
+			printProgress("Shutdown without checkpoint persistence")
 		else
 			printProgress("SAVE FAILED on shutdown")
 		end
@@ -747,7 +802,7 @@ for _, useParentOutputLateralConnection in ipairs(parentOutputLateralConnectionO
 		currentParentOutputLateralConnection = useParentOutputLateralConnection
 		currentRunId = getRunId(seed, useParentOutputLateralConnection)
 
-		local data = loadRunData(key, currentRunId, legacyExperiment)
+		local data = loadRunData(key, currentRunId)
 
 		if type(data) ~= "table"
 			or not data.network
@@ -784,160 +839,165 @@ for _, useParentOutputLateralConnection in ipairs(parentOutputLateralConnectionO
 		printProgress(progressLabel)
 		ensureEvaluationForCompletedGeneration()
 
-while batchesCompleted < maxBatches do
-	local stageNumberForBatch = getStageNumber()
+		while batchesCompleted < maxBatches do
+			local stageNumberForBatch = getStageNumber()
 
-	if stageNumberForBatch ~= lastRebirthStageNumber then
-		parentNetwork = aiModule.compressNetwork(network, networkShape)
-		network = aiModule.getNetwork(networkShape, networkShape, useParentOutputLateralConnection and networkShape[#networkShape] or 0, rng)
-		batchesSinceRebirth = 0
-		lastRebirthStageNumber = stageNumberForBatch
-		generation += 1
-	end
-
-	reset()
-
-	local currentLateralScale = getCurrentLateralScale()
-
-	for i = 1, batchSize do
-		task.wait()
-
-		local inputs = getInputs()
-		local parentActivations = nil
-		local parentOutputs = nil
-
-		if parentNetwork then
-			parentActivations = aiModule.forwardPass(parentNetwork, inputs)
-			parentOutputs = parentActivations[#parentActivations]
-		end
-
-		local activations = aiModule.forwardPass(network, inputs, parentActivations, currentLateralScale, parentOutputs)
-		local rawOutputs = activations[#activations]
-		local actionIndex = doAction(rawOutputs)
-		local reward = getReward()
-
-		batch[i] = {
-			activations = activations,
-			reward = reward,
-			actionIndex = actionIndex,
-			rawOutputs = rawOutputs,
-			parentActivations = parentActivations,
-			parentOutputs = parentOutputs,
-			lateralScale = currentLateralScale
-		}
-	end
-
-	local rewards = {}
-	local rawRewardSum = 0
-
-	for i = 1, #batch do
-		rewards[i] = batch[i].reward
-		rawRewardSum += batch[i].reward
-	end
-
-	local averageReward = rawRewardSum / #batch
-
-	averageRewardsHistory[batchesCompleted + 1] = averageReward
-
-	local newRewards = getDiscountedRewards(rewards)
-
-	local rewardSum = 0
-
-	for i = 1, #newRewards do
-		rewardSum += newRewards[i]
-	end
-
-	local rewardMean = rewardSum / #newRewards
-	local varianceSum = 0
-
-	for i = 1, #newRewards do
-		varianceSum += math.pow(newRewards[i] - rewardMean, 2)
-	end
-
-	local rewardStdDev = math.sqrt(varianceSum / #newRewards)
-
-	if rewardStdDev == 0 then
-		rewardStdDev = 1e-8
-	end
-
-	for i = 1, #newRewards do
-		batch[i].reward = (newRewards[i] - rewardMean) / rewardStdDev
-	end
-
-	local shuffledBatch = shuffleList(batch)
-	local accumulatedGradients = aiModule.getBlankGradients(network)
-
-	for i = 1, #shuffledBatch do
-		local memory = shuffledBatch[i]
-		local outputErrors = {}
-		local probabilities = softmax(memory.rawOutputs)
-
-		for j = 1, 4 do
-			if j == memory.actionIndex then
-				outputErrors[j] = memory.reward * (1 - probabilities[j])
-			else
-				outputErrors[j] = memory.reward * (0 - probabilities[j])
+			if stageNumberForBatch ~= lastRebirthStageNumber then
+				parentNetwork = aiModule.compressNetwork(network, networkShape)
+				network = aiModule.getNetwork(networkShape, networkShape, useParentOutputLateralConnection and networkShape[#networkShape] or 0, rng)
+				batchesSinceRebirth = 0
+				lastRebirthStageNumber = stageNumberForBatch
+				generation += 1
 			end
+
+			reset()
+
+			local currentLateralScale = getCurrentLateralScale()
+
+			for i = 1, batchSize do
+				task.wait()
+
+				local inputs = getInputs()
+				local parentActivations = nil
+				local parentOutputs = nil
+
+				if parentNetwork then
+					parentActivations = aiModule.forwardPass(parentNetwork, inputs)
+					parentOutputs = parentActivations[#parentActivations]
+				end
+
+				local activations = aiModule.forwardPass(network, inputs, parentActivations, currentLateralScale, parentOutputs)
+				local rawOutputs = activations[#activations]
+				local actionIndex = doAction(rawOutputs)
+				local reward = getReward()
+
+				batch[i] = {
+					activations = activations,
+					reward = reward,
+					actionIndex = actionIndex,
+					rawOutputs = rawOutputs,
+					parentActivations = parentActivations,
+					parentOutputs = parentOutputs,
+					lateralScale = currentLateralScale
+				}
+			end
+
+			local rewards = {}
+			local rawRewardSum = 0
+
+			for i = 1, #batch do
+				rewards[i] = batch[i].reward
+				rawRewardSum += batch[i].reward
+			end
+
+			local averageReward = rawRewardSum / #batch
+
+			averageRewardsHistory[batchesCompleted + 1] = averageReward
+
+			local newRewards = getDiscountedRewards(rewards)
+
+			local rewardSum = 0
+
+			for i = 1, #newRewards do
+				rewardSum += newRewards[i]
+			end
+
+			local rewardMean = rewardSum / #newRewards
+			local varianceSum = 0
+
+			for i = 1, #newRewards do
+				varianceSum += math.pow(newRewards[i] - rewardMean, 2)
+			end
+
+			local rewardStdDev = math.sqrt(varianceSum / #newRewards)
+
+			if rewardStdDev == 0 then
+				rewardStdDev = 1e-8
+			end
+
+			for i = 1, #newRewards do
+				batch[i].reward = (newRewards[i] - rewardMean) / rewardStdDev
+			end
+
+			local shuffledBatch = shuffleList(batch)
+			local accumulatedGradients = aiModule.getBlankGradients(network)
+
+			for i = 1, #shuffledBatch do
+				local memory = shuffledBatch[i]
+				local outputErrors = {}
+				local probabilities = softmax(memory.rawOutputs)
+
+				for j = 1, 4 do
+					if j == memory.actionIndex then
+						outputErrors[j] = memory.reward * (1 - probabilities[j])
+					else
+						outputErrors[j] = memory.reward * (0 - probabilities[j])
+					end
+				end
+
+				local stepGradients = aiModule.backpropagate(
+					network,
+					memory.activations,
+					outputErrors,
+					memory.parentActivations,
+					memory.lateralScale,
+					memory.parentOutputs
+				)
+				aiModule.addGradients(accumulatedGradients, stepGradients)
+			end
+
+			aiModule.updateWeights(network, accumulatedGradients)
+
+			batchesCompleted += 1
+			ensureEvaluationForCompletedGeneration()
+
+			if parentNetwork then
+				batchesSinceRebirth += 1
+			end
+
+			if checkpointPersistenceEnabled and batchesCompleted < maxBatches and batchesCompleted % checkpointEveryBatches == 0 then
+				if saveCurrentRun(false) then
+					printProgress("Checkpoint saved")
+				else
+					printProgress("CHECKPOINT SAVE FAILED")
+				end
+			end
+
+			table.clear(batch)
 		end
 
-		local stepGradients = aiModule.backpropagate(
-			network,
-			memory.activations,
-			outputErrors,
-			memory.parentActivations,
-			memory.lateralScale,
-			memory.parentOutputs
-		)
-		aiModule.addGradients(accumulatedGradients, stepGradients)
-	end
+		ensureEvaluationForCompletedGeneration()
 
-	aiModule.updateWeights(network, accumulatedGradients)
-
-	batchesCompleted += 1
-	ensureEvaluationForCompletedGeneration()
-
-	if parentNetwork then
-		batchesSinceRebirth += 1
-	end
-
-	if save and batchesCompleted < maxBatches and batchesCompleted % checkpointEveryBatches == 0 then
-		if saveCurrentRun(false) then
-			printProgress("Checkpoint saved")
+		if checkpointPersistenceEnabled and saveCurrentRun(true) then
+			printProgress("Completed")
+		elseif not checkpointPersistenceEnabled then
+			printProgress("Completed without checkpoint persistence")
 		else
-			printProgress("CHECKPOINT SAVE FAILED")
+			printProgress("FINAL SAVE FAILED")
 		end
+
+		table.insert(seedResults, {
+			seed = seed,
+			averageRewardPerBatch = table.clone(averageRewardsHistory),
+			evaluationByGeneration = evaluationByGeneration
+		})
 	end
 
-	table.clear(batch)
-end
-
-ensureEvaluationForCompletedGeneration()
-
-if saveCurrentRun(true) then
-	printProgress("Completed")
-else
-	printProgress("FINAL SAVE FAILED")
-end
-
-table.insert(seedResults, {
-	seed = seed,
-	averageRewardPerBatch = table.clone(averageRewardsHistory),
-	evaluationByGeneration = evaluationByGeneration
-})
-	end
-
-local groupedResultTable = {
-	version = checkpointVersion,
-	configFingerprint = configFingerprint,
-	expectedBatches = expectedBatches,
-	stageSequence = {"A", "B"},
-	stageLengthBatches = stageLengthBatches,
-	architecture = aiType,
-	usedParentOutputLateralConnection = useParentOutputLateralConnection,
-	seedsPerHead = #headSeeds,
-	storageVersion = runStorageVersion,
-	seeds = seedResults
-}
-print("WEANNET_GROUPED_RESULT", groupedResultTable)
-completedRunOffset += #headSeeds
+	local groupedResultTable = {
+		version = checkpointVersion,
+		configFingerprint = configFingerprint,
+		expectedBatches = expectedBatches,
+		stageSequence = {"A", "B"},
+		stageLengthBatches = stageLengthBatches,
+		architecture = aiType,
+		checkpointStorage = "per-run MSE5 shards",
+		checkpointPersistenceEnabled = checkpointPersistenceEnabled,
+		checkpointPersistenceFailure = checkpointPersistenceFailure,
+		usedParentOutputLateralConnection = useParentOutputLateralConnection,
+		seedsPerHead = #headSeeds,
+		storageVersion = runStorageVersion,
+		seeds = seedResults
+	}
+	print("WEANNET_GROUPED_RESULT", groupedResultTable)
+	completedRunOffset += #headSeeds
 end
